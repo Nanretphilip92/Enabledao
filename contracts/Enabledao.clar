@@ -1,0 +1,314 @@
+(define-constant CONTRACT_OWNER tx-sender)
+(define-constant ERR_UNAUTHORIZED (err u100))
+(define-constant ERR_INVALID_PROPOSAL (err u101))
+(define-constant ERR_ALREADY_VOTED (err u102))
+(define-constant ERR_PROPOSAL_EXPIRED (err u103))
+(define-constant ERR_PROPOSAL_NOT_EXECUTABLE (err u104))
+(define-constant ERR_INSUFFICIENT_FUNDS (err u105))
+(define-constant ERR_MEMBER_NOT_FOUND (err u106))
+(define-constant ERR_ALREADY_MEMBER (err u107))
+(define-constant ERR_INVALID_AMOUNT (err u108))
+(define-constant ERR_PROPOSAL_NOT_FOUND (err u109))
+
+(define-data-var next-proposal-id uint u1)
+(define-data-var total-members uint u0)
+(define-data-var treasury-balance uint u0)
+(define-data-var min-voting-period uint u144)
+(define-data-var quorum-threshold uint u3)
+
+(define-map members principal 
+  {
+    verified: bool,
+    join-block: uint,
+    aid-received: uint,
+    proposals-created: uint
+  }
+)
+
+(define-map proposals uint
+  {
+    creator: principal,
+    title: (string-ascii 64),
+    description: (string-ascii 256),
+    amount: uint,
+    recipient: principal,
+    yes-votes: uint,
+    no-votes: uint,
+    created-at: uint,
+    executed: bool,
+    vote-end: uint
+  }
+)
+
+(define-map votes {proposal-id: uint, voter: principal} bool)
+
+(define-map verified-members principal bool)
+
+(define-private (is-member (user principal))
+  (is-some (map-get? members user))
+)
+
+(define-private (is-verified-member (user principal))
+  (default-to false (get verified (map-get? members user)))
+)
+
+(define-private (get-current-block)
+  stacks-block-height
+)
+
+(define-private (has-voted (proposal-id uint) (voter principal))
+  (is-some (map-get? votes {proposal-id: proposal-id, voter: voter}))
+)
+
+(define-private (calculate-vote-weight (voter principal))
+  (let ((member-data (map-get? members voter)))
+    (if (is-some member-data)
+      (if (get verified (unwrap-panic member-data))
+        u2
+        u1)
+      u0)
+  )
+)
+
+(define-public (join-dao)
+  (let ((current-block (get-current-block)))
+    (if (is-member tx-sender)
+      ERR_ALREADY_MEMBER
+      (begin
+        (map-set members tx-sender
+          {
+            verified: false,
+            join-block: current-block,
+            aid-received: u0,
+            proposals-created: u0
+          }
+        )
+        (var-set total-members (+ (var-get total-members) u1))
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-public (verify-member (member principal))
+  (if (is-eq tx-sender CONTRACT_OWNER)
+    (if (is-member member)
+      (begin
+        (map-set members member
+          (merge (unwrap-panic (map-get? members member))
+                 {verified: true}
+          )
+        )
+        (map-set verified-members member true)
+        (ok true)
+      )
+      ERR_MEMBER_NOT_FOUND
+    )
+    ERR_UNAUTHORIZED
+  )
+)
+
+(define-public (create-proposal (title (string-ascii 64)) 
+                               (description (string-ascii 256))
+                               (amount uint)
+                               (recipient principal))
+  (let ((proposal-id (var-get next-proposal-id))
+        (current-block (get-current-block))
+        (member-data (map-get? members tx-sender)))
+    (if (and (is-verified-member tx-sender) (> amount u0))
+      (begin
+        (map-set proposals proposal-id
+          {
+            creator: tx-sender,
+            title: title,
+            description: description,
+            amount: amount,
+            recipient: recipient,
+            yes-votes: u0,
+            no-votes: u0,
+            created-at: current-block,
+            executed: false,
+            vote-end: (+ current-block (var-get min-voting-period))
+          }
+        )
+        (map-set members tx-sender
+          (merge (unwrap-panic member-data)
+                 {proposals-created: (+ (get proposals-created (unwrap-panic member-data)) u1)}
+          )
+        )
+        (var-set next-proposal-id (+ proposal-id u1))
+        (ok proposal-id)
+      )
+      ERR_UNAUTHORIZED
+    )
+  )
+)
+
+(define-public (vote-on-proposal (proposal-id uint) (vote-yes bool))
+  (let ((proposal (map-get? proposals proposal-id))
+        (current-block (get-current-block))
+        (vote-weight (calculate-vote-weight tx-sender)))
+    (if (and (is-some proposal) 
+             (is-member tx-sender)
+             (not (has-voted proposal-id tx-sender))
+             (< current-block (get vote-end (unwrap-panic proposal))))
+      (let ((current-proposal (unwrap-panic proposal)))
+        (map-set votes {proposal-id: proposal-id, voter: tx-sender} vote-yes)
+        (map-set proposals proposal-id
+          (merge current-proposal
+            {
+              yes-votes: (if vote-yes (+ (get yes-votes current-proposal) vote-weight) (get yes-votes current-proposal)),
+              no-votes: (if vote-yes (get no-votes current-proposal) (+ (get no-votes current-proposal) vote-weight))
+            }
+          )
+        )
+        (ok true)
+      )
+      (if (>= current-block (get vote-end (unwrap-panic (map-get? proposals proposal-id))))
+        ERR_PROPOSAL_EXPIRED
+        (if (has-voted proposal-id tx-sender)
+          ERR_ALREADY_VOTED
+          ERR_INVALID_PROPOSAL
+        )
+      )
+    )
+  )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+  (let ((proposal (map-get? proposals proposal-id))
+        (current-block (get-current-block)))
+    (if (is-some proposal)
+      (let ((current-proposal (unwrap-panic proposal))
+            (total-votes (+ (get yes-votes current-proposal) (get no-votes current-proposal))))
+        (if (and (>= current-block (get vote-end current-proposal))
+                 (not (get executed current-proposal))
+                 (>= (get yes-votes current-proposal) (get no-votes current-proposal))
+                 (>= total-votes (var-get quorum-threshold))
+                 (>= (var-get treasury-balance) (get amount current-proposal)))
+          (begin
+            (map-set proposals proposal-id
+              (merge current-proposal {executed: true})
+            )
+            (var-set treasury-balance (- (var-get treasury-balance) (get amount current-proposal)))
+            (let ((recipient-data (map-get? members (get recipient current-proposal))))
+              (if (is-some recipient-data)
+                (map-set members (get recipient current-proposal)
+                  (merge (unwrap-panic recipient-data)
+                         {aid-received: (+ (get aid-received (unwrap-panic recipient-data)) (get amount current-proposal))}
+                  )
+                )
+                true
+              )
+            )
+            (try! (as-contract (stx-transfer? (get amount current-proposal) tx-sender (get recipient current-proposal))))
+            (ok true)
+          )
+          ERR_PROPOSAL_NOT_EXECUTABLE
+        )
+      )
+      ERR_PROPOSAL_NOT_FOUND
+    )
+  )
+)
+
+(define-public (fund-treasury (amount uint))
+  (if (> amount u0)
+    (begin
+      (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+      (var-set treasury-balance (+ (var-get treasury-balance) amount))
+      (ok true)
+    )
+    ERR_INVALID_AMOUNT
+  )
+)
+
+(define-public (emergency-withdraw (amount uint))
+  (if (is-eq tx-sender CONTRACT_OWNER)
+    (if (and (> amount u0) (>= (var-get treasury-balance) amount))
+      (begin
+        (var-set treasury-balance (- (var-get treasury-balance) amount))
+        (try! (as-contract (stx-transfer? amount tx-sender CONTRACT_OWNER)))
+        (ok true)
+      )
+      ERR_INSUFFICIENT_FUNDS
+    )
+    ERR_UNAUTHORIZED
+  )
+)
+
+(define-public (update-voting-period (new-period uint))
+  (if (is-eq tx-sender CONTRACT_OWNER)
+    (begin
+      (var-set min-voting-period new-period)
+      (ok true)
+    )
+    ERR_UNAUTHORIZED
+  )
+)
+
+(define-public (update-quorum (new-quorum uint))
+  (if (is-eq tx-sender CONTRACT_OWNER)
+    (begin
+      (var-set quorum-threshold new-quorum)
+      (ok true)
+    )
+    ERR_UNAUTHORIZED
+  )
+)
+
+(define-read-only (get-member-info (member principal))
+  (map-get? members member)
+)
+
+(define-read-only (get-proposal-info (proposal-id uint))
+  (map-get? proposals proposal-id)
+)
+
+(define-read-only (get-treasury-balance)
+  (var-get treasury-balance)
+)
+
+(define-read-only (get-total-members)
+  (var-get total-members)
+)
+
+(define-read-only (get-voting-period)
+  (var-get min-voting-period)
+)
+
+(define-read-only (get-quorum-threshold)
+  (var-get quorum-threshold)
+)
+
+(define-read-only (get-vote (proposal-id uint) (voter principal))
+  (map-get? votes {proposal-id: proposal-id, voter: voter})
+)
+
+(define-read-only (is-proposal-active (proposal-id uint))
+  (let ((proposal (map-get? proposals proposal-id)))
+    (if (is-some proposal)
+      (let ((current-proposal (unwrap-panic proposal)))
+        (and (< (get-current-block) (get vote-end current-proposal))
+             (not (get executed current-proposal)))
+      )
+      false
+    )
+  )
+)
+
+(define-read-only (can-execute-proposal (proposal-id uint))
+  (let ((proposal (map-get? proposals proposal-id)))
+    (if (is-some proposal)
+      (let ((current-proposal (unwrap-panic proposal))
+            (total-votes (+ (get yes-votes current-proposal) (get no-votes current-proposal))))
+        (and (>= (get-current-block) (get vote-end current-proposal))
+             (not (get executed current-proposal))
+             (>= (get yes-votes current-proposal) (get no-votes current-proposal))
+             (>= total-votes (var-get quorum-threshold))
+             (>= (var-get treasury-balance) (get amount current-proposal)))
+      )
+      false
+    )
+  )
+)
