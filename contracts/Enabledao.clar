@@ -9,12 +9,19 @@
 (define-constant ERR_ALREADY_MEMBER (err u107))
 (define-constant ERR_INVALID_AMOUNT (err u108))
 (define-constant ERR_PROPOSAL_NOT_FOUND (err u109))
+(define-constant ERR_CANNOT_DELEGATE_TO_SELF (err u110))
+(define-constant ERR_INVALID_DELEGATE (err u111))
+(define-constant ERR_DELEGATE_NOT_FOUND (err u112))
+(define-constant ERR_NOT_DELEGATED (err u113))
+(define-constant ERR_ALREADY_DELEGATED (err u114))
+(define-constant ERR_DELEGATE_CHAIN_TOO_LONG (err u115))
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var total-members uint u0)
 (define-data-var treasury-balance uint u0)
 (define-data-var min-voting-period uint u144)
 (define-data-var quorum-threshold uint u3)
+(define-data-var max-delegation-chain uint u3)
 
 (define-map members principal 
   {
@@ -44,6 +51,24 @@
 
 (define-map verified-members principal bool)
 
+(define-map delegations principal 
+  {
+    delegate: principal,
+    delegated-at: uint,
+    active: bool
+  }
+)
+
+(define-map delegate-stats principal 
+  {
+    total-delegators: uint,
+    active-delegators: uint,
+    first-delegation: uint
+  }
+)
+
+(define-map delegation-votes {proposal-id: uint, delegate: principal, delegator: principal} bool)
+
 (define-private (is-member (user principal))
   (is-some (map-get? members user))
 )
@@ -60,6 +85,16 @@
   (is-some (map-get? votes {proposal-id: proposal-id, voter: voter}))
 )
 
+(define-private (has-active-delegation (user principal))
+  (let ((delegation-data (map-get? delegations user)))
+    (if (is-some delegation-data)
+      (get active (unwrap-panic delegation-data))
+      false)
+  )
+)
+
+
+
 (define-private (calculate-vote-weight (voter principal))
   (let ((member-data (map-get? members voter)))
     (if (is-some member-data)
@@ -67,6 +102,15 @@
         u2
         u1)
       u0)
+  )
+)
+
+(define-private (calculate-delegated-weight (delegate principal) (proposal-id uint))
+  (let ((delegate-data (map-get? delegate-stats delegate)))
+    (if (is-some delegate-data)
+      (+ (calculate-vote-weight delegate) (get active-delegators (unwrap-panic delegate-data)))
+      (calculate-vote-weight delegate)
+    )
   )
 )
 
@@ -257,6 +301,117 @@
   )
 )
 
+(define-public (delegate-voting-power (delegate principal))
+  (let ((current-block (get-current-block))
+        (existing-delegation (map-get? delegations tx-sender))
+        (delegate-member-data (map-get? members delegate)))
+    (if (and (is-member tx-sender) (is-member delegate) (not (is-eq tx-sender delegate)))
+      (if (is-none existing-delegation)
+        (begin
+          (map-set delegations tx-sender
+            {
+              delegate: delegate,
+              delegated-at: current-block,
+              active: true
+            }
+          )
+          (let ((current-stats (default-to {total-delegators: u0, active-delegators: u0, first-delegation: current-block} 
+                                          (map-get? delegate-stats delegate))))
+            (map-set delegate-stats delegate
+              {
+                total-delegators: (+ (get total-delegators current-stats) u1),
+                active-delegators: (+ (get active-delegators current-stats) u1),
+                first-delegation: (if (is-eq (get total-delegators current-stats) u0) 
+                                   current-block 
+                                   (get first-delegation current-stats))
+              }
+            )
+          )
+          (ok true)
+        )
+        ERR_ALREADY_DELEGATED
+      )
+      (if (is-eq tx-sender delegate)
+        ERR_CANNOT_DELEGATE_TO_SELF
+        ERR_INVALID_DELEGATE
+      )
+    )
+  )
+)
+
+(define-public (revoke-delegation)
+  (let ((delegation-data (map-get? delegations tx-sender)))
+    (if (is-some delegation-data)
+      (let ((current-delegation (unwrap-panic delegation-data))
+            (delegate (get delegate current-delegation)))
+        (if (get active current-delegation)
+          (begin
+            (map-set delegations tx-sender
+              (merge current-delegation {active: false})
+            )
+            (let ((current-stats (unwrap-panic (map-get? delegate-stats delegate))))
+              (map-set delegate-stats delegate
+                (merge current-stats 
+                       {active-delegators: (- (get active-delegators current-stats) u1)})
+              )
+            )
+            (ok true)
+          )
+          ERR_NOT_DELEGATED
+        )
+      )
+      ERR_NOT_DELEGATED
+    )
+  )
+)
+
+(define-public (vote-as-delegate (proposal-id uint) (vote-yes bool) (delegators (list 50 principal)))
+  (let ((proposal (map-get? proposals proposal-id))
+        (current-block (get-current-block)))
+    (if (and (is-some proposal) 
+             (is-member tx-sender)
+             (< current-block (get vote-end (unwrap-panic proposal))))
+      (let ((delegate-weight (calculate-delegated-weight tx-sender proposal-id)))
+        (if (> delegate-weight u0)
+          (begin
+            (map-set votes {proposal-id: proposal-id, voter: tx-sender} vote-yes)
+            (fold process-delegator-vote delegators 
+                  {proposal-id: proposal-id, delegate: tx-sender, vote: vote-yes, success: true})
+            (let ((current-proposal (unwrap-panic proposal)))
+              (map-set proposals proposal-id
+                (merge current-proposal
+                  {
+                    yes-votes: (if vote-yes (+ (get yes-votes current-proposal) delegate-weight) (get yes-votes current-proposal)),
+                    no-votes: (if vote-yes (get no-votes current-proposal) (+ (get no-votes current-proposal) delegate-weight))
+                  }
+                )
+              )
+            )
+            (ok true)
+          )
+          ERR_UNAUTHORIZED
+        )
+      )
+      ERR_INVALID_PROPOSAL
+    )
+  )
+)
+
+(define-private (process-delegator-vote (delegator principal) (context {proposal-id: uint, delegate: principal, vote: bool, success: bool}))
+  (let ((delegation-data (map-get? delegations delegator))
+        (proposal-id (get proposal-id context))
+        (delegate (get delegate context))
+        (vote (get vote context)))
+    (if (and (is-some delegation-data) 
+             (get active (unwrap-panic delegation-data))
+             (is-eq (get delegate (unwrap-panic delegation-data)) delegate))
+      (map-set delegation-votes {proposal-id: proposal-id, delegate: delegate, delegator: delegator} vote)
+      false
+    )
+    context
+  )
+)
+
 (define-read-only (get-member-info (member principal))
   (map-get? members member)
 )
@@ -311,4 +466,47 @@
       false
     )
   )
+)
+
+(define-read-only (get-delegation-info (delegator principal))
+  (map-get? delegations delegator)
+)
+
+(define-read-only (get-delegate-stats (delegate principal))
+  (map-get? delegate-stats delegate)
+)
+
+(define-read-only (get-effective-vote-weight (voter principal))
+  (if (has-active-delegation voter)
+    u0
+    (calculate-vote-weight voter)
+  )
+)
+
+(define-read-only (get-delegate-vote-weight (delegate principal))
+  (let ((delegate-data (map-get? delegate-stats delegate)))
+    (if (is-some delegate-data)
+      (+ (calculate-vote-weight delegate) (get active-delegators (unwrap-panic delegate-data)))
+      (calculate-vote-weight delegate)
+    )
+  )
+)
+
+(define-read-only (is-delegated-to (delegator principal) (delegate principal))
+  (let ((delegation-data (map-get? delegations delegator)))
+    (if (is-some delegation-data)
+      (let ((current-delegation (unwrap-panic delegation-data)))
+        (and (get active current-delegation) (is-eq (get delegate current-delegation) delegate))
+      )
+      false
+    )
+  )
+)
+
+(define-read-only (get-delegation-vote (proposal-id uint) (delegate principal) (delegator principal))
+  (map-get? delegation-votes {proposal-id: proposal-id, delegate: delegate, delegator: delegator})
+)
+
+(define-read-only (get-max-delegation-chain)
+  (var-get max-delegation-chain)
 )
