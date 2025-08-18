@@ -15,6 +15,9 @@
 (define-constant ERR_NOT_DELEGATED (err u113))
 (define-constant ERR_ALREADY_DELEGATED (err u114))
 (define-constant ERR_DELEGATE_CHAIN_TOO_LONG (err u115))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u116))
+(define-constant ERR_INVALID_REPUTATION_SCORE (err u117))
+(define-constant ERR_REPUTATION_UPDATE_FAILED (err u118))
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var total-members uint u0)
@@ -22,6 +25,8 @@
 (define-data-var min-voting-period uint u144)
 (define-data-var quorum-threshold uint u3)
 (define-data-var max-delegation-chain uint u3)
+(define-data-var reputation-decay-rate uint u50)
+(define-data-var reputation-boost-multiplier uint u200)
 
 (define-map members principal 
   {
@@ -69,6 +74,38 @@
 
 (define-map delegation-votes {proposal-id: uint, delegate: principal, delegator: principal} bool)
 
+(define-map reputation-scores principal
+  {
+    score: uint,
+    participation-count: uint,
+    successful-proposals: uint,
+    failed-proposals: uint,
+    last-activity: uint,
+    positive-votes: uint,
+    total-votes: uint,
+    treasury-contributions: uint,
+    reputation-level: uint
+  }
+)
+
+(define-map reputation-history {member: principal, block: uint}
+  {
+    action: (string-ascii 20),
+    score-change: int,
+    new-score: uint
+  }
+)
+
+(define-map proposal-outcomes uint
+  {
+    creator: principal,
+    passed: bool,
+    final-yes-votes: uint,
+    final-no-votes: uint,
+    execution-block: uint
+  }
+)
+
 (define-private (is-member (user principal))
   (is-some (map-get? members user))
 )
@@ -95,12 +132,55 @@
 
 
 
+(define-private (get-reputation-level (score uint))
+  (if (>= score u1000) u5
+    (if (>= score u500) u4
+      (if (>= score u200) u3
+        (if (>= score u100) u2
+          u1))))
+)
+
+(define-private (calculate-reputation-multiplier (member principal))
+  (let ((reputation-data (map-get? reputation-scores member)))
+    (if (is-some reputation-data)
+      (let ((level (get reputation-level (unwrap-panic reputation-data))))
+        (+ u100 (* level u25)))
+      u100)
+  )
+)
+
+(define-private (update-reputation-score (member principal) (action (string-ascii 20)) (score-change int))
+  (let ((current-block (get-current-block))
+        (current-reputation (default-to {score: u100, participation-count: u0, successful-proposals: u0, 
+                                       failed-proposals: u0, last-activity: u0, positive-votes: u0, 
+                                       total-votes: u0, treasury-contributions: u0, reputation-level: u1} 
+                                      (map-get? reputation-scores member))))
+    (let ((current-score (get score current-reputation))
+          (new-score (if (< score-change 0)
+                       (let ((abs-change (to-uint (- 0 score-change))))
+                         (if (>= current-score abs-change)
+                           (- current-score abs-change)
+                           u0))
+                       (+ current-score (to-uint score-change))))
+          (new-level (get-reputation-level new-score)))
+      (map-set reputation-scores member
+        (merge current-reputation 
+               {score: new-score, 
+                last-activity: current-block, 
+                reputation-level: new-level}))
+      (map-set reputation-history {member: member, block: current-block}
+        {action: action, score-change: score-change, new-score: new-score})
+      (ok new-score)
+    )
+  )
+)
+
 (define-private (calculate-vote-weight (voter principal))
-  (let ((member-data (map-get? members voter)))
+  (let ((member-data (map-get? members voter))
+        (reputation-multiplier (calculate-reputation-multiplier voter)))
     (if (is-some member-data)
-      (if (get verified (unwrap-panic member-data))
-        u2
-        u1)
+      (let ((base-weight (if (get verified (unwrap-panic member-data)) u2 u1)))
+        (/ (* base-weight reputation-multiplier) u100))
       u0)
   )
 )
@@ -127,8 +207,22 @@
             proposals-created: u0
           }
         )
+        (map-set reputation-scores tx-sender
+          {
+            score: u100,
+            participation-count: u0,
+            successful-proposals: u0,
+            failed-proposals: u0,
+            last-activity: current-block,
+            positive-votes: u0,
+            total-votes: u0,
+            treasury-contributions: u0,
+            reputation-level: u1
+          }
+        )
         (var-set total-members (+ (var-get total-members) u1))
-        (ok true)
+        (let ((reputation-result (update-reputation-score tx-sender "join" 0)))
+          (ok true))
       )
     )
   )
@@ -144,7 +238,8 @@
           )
         )
         (map-set verified-members member true)
-        (ok true)
+        (let ((reputation-result (update-reputation-score member "verification" 50)))
+          (ok true))
       )
       ERR_MEMBER_NOT_FOUND
     )
@@ -181,7 +276,8 @@
           )
         )
         (var-set next-proposal-id (+ proposal-id u1))
-        (ok proposal-id)
+        (let ((reputation-result (update-reputation-score tx-sender "create-proposal" 10)))
+          (ok proposal-id))
       )
       ERR_UNAUTHORIZED
     )
@@ -206,7 +302,15 @@
             }
           )
         )
-        (ok true)
+        (let ((current-reputation (unwrap-panic (map-get? reputation-scores tx-sender))))
+          (map-set reputation-scores tx-sender
+            (merge current-reputation
+                   {participation-count: (+ (get participation-count current-reputation) u1),
+                    total-votes: (+ (get total-votes current-reputation) u1),
+                    positive-votes: (if vote-yes (+ (get positive-votes current-reputation) u1) (get positive-votes current-reputation))}))
+        )
+        (let ((reputation-result (update-reputation-score tx-sender "vote" 5)))
+          (ok true))
       )
       (if (>= current-block (get vote-end (unwrap-panic (map-get? proposals proposal-id))))
         ERR_PROPOSAL_EXPIRED
@@ -246,7 +350,22 @@
               )
             )
             (try! (as-contract (stx-transfer? (get amount current-proposal) tx-sender (get recipient current-proposal))))
-            (ok true)
+            (map-set proposal-outcomes proposal-id
+              {
+                creator: (get creator current-proposal),
+                passed: true,
+                final-yes-votes: (get yes-votes current-proposal),
+                final-no-votes: (get no-votes current-proposal),
+                execution-block: current-block
+              }
+            )
+            (let ((creator-reputation (unwrap-panic (map-get? reputation-scores (get creator current-proposal)))))
+              (map-set reputation-scores (get creator current-proposal)
+                (merge creator-reputation
+                       {successful-proposals: (+ (get successful-proposals creator-reputation) u1)}))
+            )
+            (let ((reputation-result (update-reputation-score (get creator current-proposal) "proposal-passed" 50)))
+              (ok true))
           )
           ERR_PROPOSAL_NOT_EXECUTABLE
         )
@@ -261,7 +380,16 @@
     (begin
       (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
       (var-set treasury-balance (+ (var-get treasury-balance) amount))
-      (ok true)
+      (let ((current-reputation (default-to {score: u100, participation-count: u0, successful-proposals: u0, 
+                                            failed-proposals: u0, last-activity: u0, positive-votes: u0, 
+                                            total-votes: u0, treasury-contributions: u0, reputation-level: u1} 
+                                           (map-get? reputation-scores tx-sender))))
+        (map-set reputation-scores tx-sender
+          (merge current-reputation
+                 {treasury-contributions: (+ (get treasury-contributions current-reputation) amount)}))
+      )
+      (let ((reputation-result (update-reputation-score tx-sender "fund-treasury" (to-int (/ amount u100000)))))
+        (ok true))
     )
     ERR_INVALID_AMOUNT
   )
@@ -510,3 +638,165 @@
 (define-read-only (get-max-delegation-chain)
   (var-get max-delegation-chain)
 )
+
+(define-public (update-reputation-manually (member principal) (score-change int) (reason (string-ascii 20)))
+  (if (is-eq tx-sender CONTRACT_OWNER)
+    (if (is-member member)
+      (update-reputation-score member reason score-change)
+      ERR_MEMBER_NOT_FOUND
+    )
+    ERR_UNAUTHORIZED
+  )
+)
+
+(define-public (decay-reputation (member principal))
+  (if (is-member member)
+    (let ((current-reputation (map-get? reputation-scores member))
+          (current-block (get-current-block)))
+      (if (is-some current-reputation)
+        (let ((reputation-data (unwrap-panic current-reputation))
+              (blocks-since-activity (- current-block (get last-activity reputation-data))))
+          (if (> blocks-since-activity u1440)
+            (let ((decay-amount (to-int (- u0 (/ (var-get reputation-decay-rate) u10)))))
+              (update-reputation-score member "decay" decay-amount)
+            )
+            (ok (get score reputation-data))
+          )
+        )
+        (ok u100)
+      )
+    )
+    ERR_MEMBER_NOT_FOUND
+  )
+)
+
+(define-public (boost-reputation-for-activity (member principal))
+  (if (is-eq tx-sender CONTRACT_OWNER)
+    (if (is-member member)
+      (let ((current-reputation (map-get? reputation-scores member)))
+        (if (is-some current-reputation)
+          (let ((reputation-data (unwrap-panic current-reputation))
+                (activity-bonus (to-int (/ (* (get participation-count reputation-data) (var-get reputation-boost-multiplier)) u100))))
+            (update-reputation-score member "activity-boost" activity-bonus)
+          )
+          (ok u100)
+        )
+      )
+      ERR_MEMBER_NOT_FOUND
+    )
+    ERR_UNAUTHORIZED
+  )
+)
+
+(define-public (batch-update-reputation (member-list (list 20 principal)) (score-changes (list 20 int)) (reason (string-ascii 20)))
+  (if (is-eq tx-sender CONTRACT_OWNER)
+    (if (is-eq (len member-list) (len score-changes))
+      (begin
+        (fold batch-reputation-updater 
+              member-list 
+              {reason: reason, success: true, scores: score-changes, index: u0})
+        (ok true)
+      )
+      ERR_INVALID_REPUTATION_SCORE
+    )
+    ERR_UNAUTHORIZED
+  )
+)
+
+(define-private (batch-reputation-updater (member principal) (context {reason: (string-ascii 20), success: bool, scores: (list 20 int), index: uint}))
+  (let ((score-change (default-to 0 (element-at (get scores context) (get index context))))
+        (reason (get reason context)))
+    (let ((reputation-result (if (is-member member)
+                               (update-reputation-score member reason score-change)
+                               (ok u0))))
+      {reason: reason, success: true, scores: (get scores context), index: (+ (get index context) u1)})
+  )
+)
+
+(define-public (penalize-failed-proposal (proposal-id uint))
+  (let ((proposal-outcome (map-get? proposal-outcomes proposal-id)))
+    (if (and (is-some proposal-outcome) (is-eq tx-sender CONTRACT_OWNER))
+      (let ((outcome-data (unwrap-panic proposal-outcome))
+            (creator (get creator outcome-data)))
+        (if (not (get passed outcome-data))
+          (begin
+            (let ((creator-reputation (unwrap-panic (map-get? reputation-scores creator))))
+              (map-set reputation-scores creator
+                (merge creator-reputation
+                       {failed-proposals: (+ (get failed-proposals creator-reputation) u1)}))
+            )
+            (let ((reputation-result (update-reputation-score creator "proposal-failed" -20)))
+              (ok true))
+          )
+          (ok true)
+        )
+      )
+      ERR_PROPOSAL_NOT_FOUND
+    )
+  )
+)
+
+(define-read-only (get-reputation-score (member principal))
+  (map-get? reputation-scores member)
+)
+
+(define-read-only (get-reputation-history (member principal) (block uint))
+  (map-get? reputation-history {member: member, block: block})
+)
+
+(define-read-only (get-proposal-outcome (proposal-id uint))
+  (map-get? proposal-outcomes proposal-id)
+)
+
+(define-read-only (calculate-reputation-weight (member principal))
+  (let ((base-weight (calculate-vote-weight member))
+        (reputation-data (map-get? reputation-scores member)))
+    (if (is-some reputation-data)
+      (let ((level (get reputation-level (unwrap-panic reputation-data))))
+        (+ base-weight (/ level u2)))
+      base-weight)
+  )
+)
+
+(define-read-only (get-reputation-level-name (level uint))
+  (if (is-eq level u5) "Expert"
+    (if (is-eq level u4) "Advanced"
+      (if (is-eq level u3) "Intermediate"
+        (if (is-eq level u2) "Member"
+          "Newcomer"))))
+)
+
+(define-read-only (get-member-reputation-summary (member principal))
+  (let ((reputation-data (map-get? reputation-scores member))
+        (member-data (map-get? members member)))
+    (if (and (is-some reputation-data) (is-some member-data))
+      (let ((rep-data (unwrap-panic reputation-data))
+            (mem-data (unwrap-panic member-data)))
+        (some {
+          score: (get score rep-data),
+          level: (get reputation-level rep-data),
+          level-name: (get-reputation-level-name (get reputation-level rep-data)),
+          participation-count: (get participation-count rep-data),
+          successful-proposals: (get successful-proposals rep-data),
+          failed-proposals: (get failed-proposals rep-data),
+          positive-vote-ratio: (if (> (get total-votes rep-data) u0) 
+                                 (/ (* (get positive-votes rep-data) u100) (get total-votes rep-data)) 
+                                 u0),
+          treasury-contributions: (get treasury-contributions rep-data),
+          is-verified: (get verified mem-data),
+          current-vote-weight: (calculate-reputation-weight member)
+        })
+      )
+      none
+    )
+  )
+)
+
+(define-read-only (get-top-members-by-reputation (limit uint))
+  (if (<= limit u50)
+    (ok "Feature not implemented in this version")
+    ERR_INVALID_REPUTATION_SCORE
+  )
+)
+
+
