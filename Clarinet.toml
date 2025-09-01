@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Enabledao.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.aid-impact-tracker]
+path = 'contracts/aid-impact-tracker.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
